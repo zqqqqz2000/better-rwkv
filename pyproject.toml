@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "better-rwkv"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+torch = "^2.3.1"
+pytorch-lightning = "1.9.5"
+deepspeed = "^0.14.4"
+wandb = "^0.17.3"
+ninja = "^1.11.1.1"
+
+[[tool.poetry.source]]
+name = "torch"
+url = "https://download.pytorch.org/whl/cu121"
+priority = "supplemental"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
