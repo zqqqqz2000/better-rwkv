@@ -209,7 +209,7 @@ def init_rwkv_cuda(head_size: int, ctx_len: int):
     return RWKVCuda
 
 
-class RWKV_Tmix_x060(Module):
+class TimeMixing(Module):
     def __init__(self, args, layer_id):
         super().__init__()
         self.args = args
@@ -263,12 +263,9 @@ class RWKV_Tmix_x060(Module):
         self.output = nn.Linear(args.dim_att, args.n_embd, bias=False)
         self.gate = nn.Linear(args.n_embd, args.dim_att, bias=False)
         self.ln_x = nn.GroupNorm(self.n_head, args.dim_att, eps=(1e-5) * (args.head_size_divisor**2))
-        # TODO: ctxlen
-        self.rwkv_cuda = init_rwkv_cuda(
-            self.head_size,
-        )
+        self.rwkv_cuda = init_rwkv_cuda(self.head_size, self.ctx_len)
 
-    def as_jit(self) -> "TimeMixingState":
+    def as_jit(self) -> "TimeMixing":
         self.forward_part1 = torch.jit.script(self.forward_part1)  # type: ignore
         self.forward_part2 = torch.jit.script(self.forward_part2)  # type: ignore
         return torch.jit.script(self)  # type: ignore
@@ -372,7 +369,7 @@ class TimeMixingState(Module):
         self.output = nn.Linear(args.dim_att, args.n_embd, bias=False)
         self.gate = nn.Linear(args.n_embd, args.dim_att, bias=False)
         self.ln_x = nn.GroupNorm(self.n_head, args.dim_att, eps=(1e-5) * (args.head_size_divisor**2))
-        self.state_cuda = init_state_autograd(self.ctx_len, self.head_size)
+        self.state_cuda = init_state_autograd(self.head_size, self.ctx_len)
 
     def forward_part1(self, x):
         """
@@ -431,7 +428,7 @@ class TimeMixingState(Module):
 
 
 class ChannelMixing(Module):
-    def __init__(self, args, layer_id):
+    def __init__(self, args, layer_id: int):
         super().__init__()
         self.args = args
         self.layer_id = layer_id
@@ -449,7 +446,7 @@ class ChannelMixing(Module):
         self.receptance = nn.Linear(args.n_embd, args.n_embd, bias=False)
         self.value = nn.Linear(args.dim_ffn, args.n_embd, bias=False)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         xx = self.time_shift(x) - x
         xk = x + xx * self.time_maa_k
         xr = x + xx * self.time_maa_r
@@ -481,7 +478,7 @@ class Block(nn.Module):
             if trainable_state:
                 self.att = TimeMixingState(args, layer_id)
             else:
-                self.att = RWKV_Tmix_x060(args, layer_id)
+                self.att = TimeMixing(args, layer_id)
         self.ffn = ChannelMixing(args, layer_id)
         if args.tiny_att_dim > 0 and self.layer_id == args.tiny_att_layer:
             self.tiny_ln = nn.LayerNorm(args.n_embd)
@@ -494,7 +491,7 @@ class Block(nn.Module):
             self.drop0 = nn.Dropout(p=args.dropout)
             self.drop1 = nn.Dropout(p=args.dropout)
 
-    def forward(self, x, x_emb=None):
+    def forward(self, x: torch.Tensor, x_emb_for_tinyattn: Optional[torch.Tensor] = None):
         args = self.args
         B, T, C = x.size()
         if self.layer_id == 0:
@@ -522,7 +519,7 @@ class Block(nn.Module):
             k = self.tiny_k(xx)[:, :T, :]
             c = (q @ k.transpose(-2, -1)) * (args.tiny_att_dim ** (-0.5))
             c = c.masked_fill(self.tiny_mask[:T, :T] == 0, 0)
-            x = x + c @ self.tiny_v(x_emb)
+            x = x + c @ self.tiny_v(x_emb_for_tinyattn)
         return x
 
 
@@ -585,18 +582,9 @@ class RWKV(Module):
 
         if args.dropout > 0:
             x = self.drop0(x)
-        if args.tiny_att_dim > 0:
-            for block in self.blocks:
-                if args.grad_cp == 1:
-                    x = deepspeed.checkpointing.checkpoint(block, x, x_emb)
-                else:
-                    x = block(x, x_emb)
-        else:
-            for block in self.blocks:
-                if args.grad_cp == 1:
-                    x = deepspeed.checkpointing.checkpoint(block, x)
-                else:
-                    x = block(x)
+
+        for block in self.blocks:
+            x = block(x, x_emb)
 
         x = self.ln_out(x)
 
