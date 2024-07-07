@@ -3,23 +3,19 @@
 ########################################################################################################
 
 import os, math, gc
+from typing import Dict, Optional
 import torch
 
 import torch.nn as nn
 from torch.nn import Module, functional as F
 import pytorch_lightning as pl
-from pytorch_lightning.strategies import DeepSpeedStrategy
 from torch.utils.cpp_extension import load
-
-# if importlib.util.find_spec("deepspeed"):
-#     import deepspeed
-#     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 
 
 def init_state_autograd(head_size: int, ctx_len: int):
     wkv6state_cuda = load(
         name="wkv6state",
-        sources=["cuda/wkv6state_op.cpp", f"cuda/wkv6state_cuda.cu"],
+        sources=["wkv6state_op.cpp", f"wkv6state_cuda.cu"],
         verbose=True,
         extra_cuda_cflags=[
             "-res-usage",
@@ -127,7 +123,7 @@ def init_rwkv_cuda(head_size: int, ctx_len: int):
             super().__init__(*args, **kwargs)
             self.wkv6_cuda = load(
                 name="wkv6",
-                sources=["cuda/wkv6_op.cpp", f"cuda/wkv6_cuda.cu"],
+                sources=["wkv6_op.cpp", f"wkv6_cuda.cu"],
                 verbose=True,
                 extra_cuda_cflags=[
                     "-res-usage",
@@ -158,9 +154,7 @@ def init_rwkv_cuda(head_size: int, ctx_len: int):
                 assert w.is_contiguous()
                 assert u.is_contiguous()
                 ctx.save_for_backward(r, k, v, w, u)
-                y = torch.empty(
-                    (B, T, C), device=r.device, dtype=torch.bfloat16, memory_format=torch.contiguous_format
-                )  # .uniform_(-100, 100)
+                y = torch.empty((B, T, C), device=r.device, dtype=torch.bfloat16, memory_format=torch.contiguous_format)
                 self.wkv6_cuda.forward(B, T, C, H, r, k, v, w, u, y)
                 return y
 
@@ -179,35 +173,35 @@ def init_rwkv_cuda(head_size: int, ctx_len: int):
                     requires_grad=False,
                     dtype=torch.bfloat16,
                     memory_format=torch.contiguous_format,
-                )  # .uniform_(-100, 100)
+                )
                 gk = torch.empty(
                     (B, T, C),
                     device=gy.device,
                     requires_grad=False,
                     dtype=torch.bfloat16,
                     memory_format=torch.contiguous_format,
-                )  # .uniform_(-100, 100)
+                )
                 gv = torch.empty(
                     (B, T, C),
                     device=gy.device,
                     requires_grad=False,
                     dtype=torch.bfloat16,
                     memory_format=torch.contiguous_format,
-                )  # .uniform_(-100, 100)
+                )
                 gw = torch.empty(
                     (B, T, C),
                     device=gy.device,
                     requires_grad=False,
                     dtype=torch.bfloat16,
                     memory_format=torch.contiguous_format,
-                )  # .uniform_(-100, 100)
+                )
                 gu = torch.empty(
                     (B, C),
                     device=gy.device,
                     requires_grad=False,
                     dtype=torch.bfloat16,
                     memory_format=torch.contiguous_format,
-                )  # .uniform_(-100, 100)
+                )
                 self.wkv6_cuda.backward(B, T, C, H, r, k, v, w, u, gy, gr, gk, gv, gw, gu)
                 gu = torch.sum(gu, 0).view(H, C // H)
                 return (None, None, None, None, gr, gk, gv, gw, gu)
@@ -321,9 +315,6 @@ class RWKV_Tmix_x060(Module):
         x = self.rwkv_cuda.apply(B, T, C, H, r, k, v, w, u=self.time_faaaa)
 
         return self.forward_part2(x, g)
-
-
-########################################################################################################
 
 
 class TimeMixingState(Module):
@@ -470,7 +461,7 @@ class ChannelMixing(Module):
 
 
 class Block(nn.Module):
-    def __init__(self, args, layer_id):
+    def __init__(self, args, layer_id: int, trainable_state: bool = False):
         super().__init__()
         self.args = args
         self.layer_id = layer_id
@@ -484,10 +475,13 @@ class Block(nn.Module):
                 self.pos_emb_x = nn.Parameter(torch.zeros((1, args.my_pos_emb, args.n_embd)))
                 self.pos_emb_y = nn.Parameter(torch.zeros((args.my_pos_emb, 1, args.n_embd)))
 
-        if os.environ["RWKV_TRAIN_TYPE"] == "states":
-            self.att = TimeMixingState(args, layer_id)
+        if self.layer_id == 0 and self.args.pre_ffn > 0:
+            self.pre_ffn = ChannelMixing(args, 0)
         else:
-            self.att = RWKV_Tmix_x060(args, layer_id)
+            if trainable_state:
+                self.att = TimeMixingState(args, layer_id)
+            else:
+                self.att = RWKV_Tmix_x060(args, layer_id)
         self.ffn = ChannelMixing(args, layer_id)
         if args.tiny_att_dim > 0 and self.layer_id == args.tiny_att_layer:
             self.tiny_ln = nn.LayerNorm(args.n_embd)
@@ -511,13 +505,13 @@ class Block(nn.Module):
 
         if self.args.dropout == 0:
             if self.layer_id == 0 and args.pre_ffn > 0:
-                x = x + self.ffnPre(self.ln1(x))
+                x = x + self.pre_ffn(self.ln1(x))
             else:
                 x = x + self.att(self.ln1(x))
             x = x + self.ffn(self.ln2(x))
         else:
             if self.layer_id == 0 and args.pre_ffn > 0:
-                x = self.drop0(x + self.ffnPre(self.ln1(x)))
+                x = self.drop0(x + self.pre_ffn(self.ln1(x)))
             else:
                 x = self.drop0(x + self.att(self.ln1(x)))
             x = self.drop1(x + self.ffn(self.ln2(x)))
@@ -549,17 +543,14 @@ class L2Wrap(torch.autograd.Function):
         return (grad_output, gy)
 
 
-class RWKV(pl.LightningModule):
+class RWKV(Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
         if not hasattr(args, "dim_att"):
             args.dim_att = args.n_embd
         if not hasattr(args, "dim_ffn"):
-            if "-f4" in os.environ["RWKV_MY_TESTING"]:
-                args.dim_ffn = int((args.n_embd * 4) // 32 * 32)
-            else:
-                args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32)  # default = 3.5x emb size
+            args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32)
         if not hasattr(args, "tiny_att_layer"):
             args.tiny_att_layer = -1
         if not hasattr(args, "tiny_att_dim"):
@@ -582,140 +573,9 @@ class RWKV(pl.LightningModule):
         if args.dropout > 0:
             self.drop0 = nn.Dropout(p=args.dropout)
 
-    def configure_optimizers(self):
-        args = self.args
+    # TODO: config optm
 
-        lr_decay = set()
-        lr_1x = set()
-        lr_2x = set()
-        lr_3x = set()
-        for n, p in self.named_parameters():
-
-            # if not p.requires_grad:
-            #     continue
-            if args.train_type == "states":
-                if "time_sta" not in n:
-                    continue
-
-            if (("_w1" in n) or ("_w2" in n)) and (args.layerwise_lr > 0):
-                lr_1x.add(n)
-            elif ("time_sta" in n) and (args.weight_decay > 0):
-                lr_decay.add(n)
-            elif (("time_mix" in n) or ("time_maa" in n)) and (args.layerwise_lr > 0):
-                if args.my_pile_stage == 2:
-                    lr_2x.add(n)
-                else:
-                    lr_1x.add(n)
-            elif (("time_decay" in n) or ("time_daaaa" in n)) and (args.layerwise_lr > 0):
-                if args.my_pile_stage == 2:
-                    lr_3x.add(n)
-                else:
-                    lr_2x.add(n)
-            elif ("time_faaaa" in n) and (args.layerwise_lr > 0):
-                if args.my_pile_stage == 2:
-                    lr_2x.add(n)
-                else:
-                    lr_1x.add(n)
-            elif ("time_first" in n) and (args.layerwise_lr > 0):
-                lr_3x.add(n)
-            elif (len(p.squeeze().shape) >= 2) and (args.weight_decay > 0):
-                lr_decay.add(n)
-            else:
-                lr_1x.add(n)
-
-        lr_decay = sorted(list(lr_decay))
-        lr_1x = sorted(list(lr_1x))
-        lr_2x = sorted(list(lr_2x))
-        lr_3x = sorted(list(lr_3x))
-
-        if self.trainer.is_global_zero:
-            print("decay", lr_decay, "\n")
-            print("1x", lr_1x, "\n")
-            print("2x", lr_2x, "\n")
-            print("3x", lr_3x, "\n")
-
-        param_dict = {n: p for n, p in self.named_parameters()}
-
-        if args.layerwise_lr > 0:
-            if args.my_pile_stage == 2:
-                optim_groups = [
-                    {"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "my_lr_scale": 1.0},
-                    {
-                        "params": [param_dict[n] for n in lr_2x],
-                        "weight_decay": 0.0,
-                        "my_lr_scale": 5.0,
-                    },  # test: 2e-3 / args.lr_init},
-                    {
-                        "params": [param_dict[n] for n in lr_3x],
-                        "weight_decay": 0.0,
-                        "my_lr_scale": 5.0,
-                    },  # test: 3e-3 / args.lr_init},
-                ]
-            else:
-                optim_groups = [
-                    {"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "my_lr_scale": 1.0},
-                    {"params": [param_dict[n] for n in lr_2x], "weight_decay": 0.0, "my_lr_scale": 2.0},
-                    {"params": [param_dict[n] for n in lr_3x], "weight_decay": 0.0, "my_lr_scale": 3.0},
-                ]
-        else:
-            optim_groups = [{"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "my_lr_scale": 1.0}]
-
-        if args.weight_decay > 0:
-            optim_groups += [
-                {"params": [param_dict[n] for n in lr_decay], "weight_decay": args.weight_decay, "my_lr_scale": 1.0}
-            ]
-            if self.deepspeed_offload:
-                return DeepSpeedCPUAdam(
-                    optim_groups,
-                    lr=self.args.lr_init,
-                    betas=self.args.betas,
-                    eps=self.args.adam_eps,
-                    bias_correction=True,
-                    adamw_mode=True,
-                    amsgrad=False,
-                )
-            return FusedAdam(
-                optim_groups,
-                lr=self.args.lr_init,
-                betas=self.args.betas,
-                eps=self.args.adam_eps,
-                bias_correction=True,
-                adam_w_mode=True,
-                amsgrad=False,
-            )
-        else:
-            if self.deepspeed_offload:
-                return DeepSpeedCPUAdam(
-                    optim_groups,
-                    lr=self.args.lr_init,
-                    betas=self.args.betas,
-                    eps=self.args.adam_eps,
-                    bias_correction=True,
-                    adamw_mode=False,
-                    weight_decay=0,
-                    amsgrad=False,
-                )
-            return FusedAdam(
-                optim_groups,
-                lr=self.args.lr_init,
-                betas=self.args.betas,
-                eps=self.args.adam_eps,
-                bias_correction=True,
-                adam_w_mode=False,
-                weight_decay=0,
-                amsgrad=False,
-            )
-        # return ZeroOneAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, weight_decay=0, amsgrad=False, cuda_aware=False)
-
-    @property
-    def deepspeed_offload(self) -> bool:
-        strategy = self.trainer.strategy
-        if isinstance(strategy, DeepSpeedStrategy):
-            cfg = strategy.config["zero_optimization"]
-            return cfg.get("offload_optimizer") or cfg.get("offload_param")
-        return False
-
-    def forward(self, idx):
+    def forward(self, idx: torch.Tensor):
         args = self.args
         B, T = idx.size()
         assert T <= args.ctx_len, "Cannot forward, model ctx_len is exhausted."
@@ -745,13 +605,7 @@ class RWKV(pl.LightningModule):
             k = self.head_k(x)[:, :T, :]
             c = (q @ k.transpose(-2, -1)) * (1.0 / args.head_qk)
             c = c.masked_fill(self.copy_mask[:T, :T] == 0, 0)
-
-            if "32" in os.environ["RWKV_FLOAT_MODE"]:
-                c = c @ F.one_hot(idx, num_classes=args.vocab_size)
-            elif os.environ["RWKV_FLOAT_MODE"] == "fp16":
-                c = c @ F.one_hot(idx, num_classes=args.vocab_size).half()
-            elif os.environ["RWKV_FLOAT_MODE"] == "bf16":
-                c = c @ F.one_hot(idx, num_classes=args.vocab_size).bfloat16()
+            c = c @ F.one_hot(idx, num_classes=args.vocab_size)
 
             x = self.head(x) + c
         else:
@@ -759,173 +613,81 @@ class RWKV(pl.LightningModule):
 
         return x
 
-    def training_step(self, batch, batch_idx):
-        args = self.args
-        if args.my_qa_mask != 1:
-            idx, targets = batch
-            logits = self(idx)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-            # if '0' in os.environ["RWKV_MY_TESTING"]:
-            #     print('logits', logits)
-            #     torch.set_printoptions(threshold=10000)
-            #     print('idx', idx)
-            #     exit(0)
-        else:
-            idx, targets, mask = batch
-            mask = mask.view(-1)
-            sum_mask = torch.sum(mask).item()
-            # if sum_mask == 0:
-            #     return torch.tensor([0.0], requires_grad=True)
-
-            logits = self(idx)
-            if sum_mask == mask.shape[0]:
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-                # print('rank', self.global_rank, 'loss', loss.item())
-            else:
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction="none")
-                # loss_raw = loss
-                loss = torch.sum(loss * mask) / sum_mask
-
-                # torch.set_printoptions(threshold=10000)
-                # if True: #self.global_rank == 1:
-                #     tmp = ''
-                #     sss = 0
-                #     ccc = 0
-                #     for i in range(mask.shape[0]):
-                #         if mask[i] > 0:
-                #             tmp += str(idx.view(-1)[i].item()) + ','
-                #             sss += loss_raw.view(-1)[i].float().item()
-                #             ccc += 1
-                #     print('rank', self.global_rank, 'loss', loss.item(), 'lavg', sss / ccc)#, 'tmp', tmp, 'input', idx)
-
-        return L2Wrap.apply(loss, logits)
-
-    def training_step_end(self, batch_parts):
-        if pl.__version__[0] != "2":
-            all = self.all_gather(batch_parts)
-            if self.trainer.is_global_zero:
-                self.trainer.my_loss_all = all
-
-    def generate_init_weight(self):
-        print(
-            f"""
-############################################################################
-#
-# Init model weight (slow for large models)...
-#
-############################################################################
-"""
-        )
-        m = {}
-        n_params = 0
-        for n in self.state_dict():
-            p = self.state_dict()[n]
-            shape = p.shape
-
-            s0 = str(shape[0]) if len(shape) > 0 else ""
-            s1 = str(shape[1]) if len(shape) > 1 else ""
-            s2 = str(shape[2]) if len(shape) > 2 else ""
-            print(f"{s0.ljust(5)} {s1.ljust(5)} {s2.ljust(5)} {n}", end="")
+    def init_weight(self, dtype: Optional[torch.dtype]):
+        params: Dict[str, torch.Tensor] = {}
+        for layer_name, layer_param in self.state_dict().items():
+            shape = layer_param.shape
 
             scale = 1.0
             if (
-                "ln_" in n
-                or ".ln" in n
-                or "time_" in n
-                or "_mask" in n
-                or "pos_emb" in n
-                or ".mask." in n
-                or n.endswith("_w")
-                or n.endswith("_w1")
-                or n.endswith("_w2")
-                or n.endswith("_bias")
+                "ln_" in layer_name
+                or ".ln" in layer_name
+                or "time_" in layer_name
+                or "_mask" in layer_name
+                or "pos_emb" in layer_name
+                or ".mask." in layer_name
+                or layer_name.endswith("_w")
+                or layer_name.endswith("_w1")
+                or layer_name.endswith("_w2")
+                or layer_name.endswith("_bias")
             ):
-                if "ln_x.weight" in n:
-                    layer_scale = (1 + int(n.split(".")[1])) / self.args.n_layer
-                    m[n] = (p * 0.0) + (layer_scale**0.7)
+                if "ln_x.weight" in layer_name:
+                    layer_scale = (1 + int(layer_name.split(".")[1])) / self.args.n_layer
+                    params[layer_name] = (layer_param * 0.0) + (layer_scale**0.7)
                 else:
-                    m[n] = p
-                print()
-            elif n == "emb.weight":
-                m[n] = p
+                    params[layer_name] = layer_param
+            elif layer_name == "emb.weight":
+                params[layer_name] = layer_param
                 scale = -1e-4
-                nn.init.uniform_(m[n], a=scale, b=-scale)
-                print(f" [scale {scale}]")
-            elif n == "head.weight":
-                m[n] = p
+                nn.init.uniform_(params[layer_name], a=scale, b=-scale)
+            elif layer_name == "head.weight":
+                params[layer_name] = layer_param
                 if self.args.vocab_size > self.args.n_embd:
                     scale = 0.5 * math.sqrt(self.args.vocab_size / self.args.n_embd)
                 else:
                     scale = 0.5
-                nn.init.orthogonal_(m[n], gain=scale)
-                print(f" [scale {scale}]")
+                nn.init.orthogonal_(params[layer_name], gain=scale)
             else:
-                if "mamba" in os.environ["RWKV_MY_TESTING"]:
-                    m[n] = p
-                    if ".out_proj.weight" in n:
-                        scale = 0
-                        nn.init.zeros_(m[n])
-                        print(f" [scale {scale}]")
-                    elif ".bias" in n:
-                        scale = 0
-                        nn.init.zeros_(m[n])
-                        print(f" [scale {scale}]")
-                    else:
-                        print()
-                else:
-                    assert n.endswith(".weight")  # should always be true
+                assert layer_name.endswith(".weight")
 
-                    zero = [
-                        ".att.output.",
-                        ".ffn.value.",
-                        ".ffn.receptance.",
-                        ".ffnPre.value.",
-                        ".ffnPre.receptance.",
-                        "head_q.",
-                        ".oo.",
-                        ".rr.",
-                    ]
+                zero = [
+                    ".att.output.",
+                    ".ffn.value.",
+                    ".ffn.receptance.",
+                    ".ffnPre.value.",
+                    ".ffnPre.receptance.",
+                    "head_q.",
+                    ".oo.",
+                    ".rr.",
+                ]
 
-                    for kk in zero:
-                        if kk in n:
-                            scale = 0
-                    if "head_k." in n:
+                for kk in zero:
+                    if kk in layer_name:
+                        scale = 0
+                if "head_k." in layer_name:
+                    scale = 0.1
+                if "head_q." in layer_name:
+                    scale = 0
+
+                for kk in [".att.key."]:
+                    if kk in layer_name:
                         scale = 0.1
-                    if "head_q." in n:
-                        scale = 0
+                for kk in [".att.gate."]:
+                    if kk in layer_name:
+                        scale = 0.1
 
-                    for kk in [".att.key."]:
-                        if kk in n:
-                            scale = 0.1
-                    for kk in [".att.gate."]:
-                        if kk in n:
-                            scale = 0.1
+                params[layer_name] = torch.empty((shape[0], shape[1]))
 
-                    print(f" [scale {scale}]")
+                if scale == 0:
+                    nn.init.zeros_(params[layer_name])
+                elif scale < 0:
+                    nn.init.uniform_(params[layer_name], a=scale, b=-scale)
+                else:
+                    nn.init.orthogonal_(params[layer_name], gain=scale)
 
-                    if self.args.accelerator.upper() == "GPU":
-                        m[n] = torch.empty((shape[0], shape[1]), device="cuda")
-                    else:
-                        m[n] = torch.empty((shape[0], shape[1]))
+                if dtype is not None:
+                    params[layer_name] = params[layer_name].type(dtype)
 
-                    if scale == 0:
-                        nn.init.zeros_(m[n])
-                    elif scale < 0:
-                        nn.init.uniform_(m[n], a=scale, b=-scale)
-                    else:
-                        nn.init.orthogonal_(m[n], gain=scale)
-
-            m[n] = m[n].cpu()
-            if os.environ["RWKV_FLOAT_MODE"] == "fp16":
-                m[n] = m[n].half()
-            elif os.environ["RWKV_FLOAT_MODE"] == "bf16":
-                m[n] = m[n].bfloat16()
-            n_params += m[n].numel()
-
-            # if n == "emb.weight":
-            #     print(m[n])
-
-        print("model params", n_params)
         gc.collect()
         torch.cuda.empty_cache()
-        return m
+        return params
