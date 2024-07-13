@@ -207,7 +207,7 @@ def init_rwkv_cuda(head_size: int, ctx_len: int):
                 )
                 wkv6_cuda.backward(B, T, C, H, r, k, v, w, u, gy, gr, gk, gv, gw, gu)
                 gu = torch.sum(gu, 0).view(H, C // H)
-                return (None, None, None, None, gr, gk, gv, gw, gu)
+                return (gr, gk, gv, gw, gu)
 
     return RWKVCuda.apply
 
