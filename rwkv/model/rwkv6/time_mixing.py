@@ -1,12 +1,20 @@
-from torch import nn
+from torch import nn, functional as F
 import torch
 from torch.utils.cpp_extension import load
+from pathlib import Path
+
+
+def resolve_relative_curr_path(relative_path: str) -> str:
+    return str(Path(__file__).parent / relative_path)
 
 
 def init_state_autograd(head_size: int, ctx_len: int):
     wkv6state_cuda = load(
         name="wkv6state",
-        sources=["time_mixing_state_op.cpp", f"time_mixing_state_cuda.cu"],
+        sources=[
+            resolve_relative_curr_path("time_mixing_state_op.cpp"),
+            resolve_relative_curr_path("time_mixing_state_cuda.cu"),
+        ],
         verbose=True,
         extra_cuda_cflags=[
             "-res-usage",
@@ -20,19 +28,16 @@ def init_state_autograd(head_size: int, ctx_len: int):
     )
 
     class StateCuda(torch.autograd.Function):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.head_size = head_size
-
-        def forward(self, ctx, B, T, C, H, r, k, v, w, u, s):
+        @staticmethod
+        def forward(ctx, B, T, C, H, r, k, v, w, u, s):
             with torch.no_grad():
-                assert r.dtype == torch.bfloat16
-                assert k.dtype == torch.bfloat16
-                assert v.dtype == torch.bfloat16
-                assert w.dtype == torch.bfloat16
-                assert u.dtype == torch.bfloat16
-                assert s.dtype == torch.bfloat16
-                assert self.head_size == C // H
+                assert r.dtype == torch.bfloat16, f"{r.dtype} is not bf16"
+                assert k.dtype == torch.bfloat16, f"{k.dtype} is not bf16"
+                assert v.dtype == torch.bfloat16, f"{v.dtype} is not bf16"
+                assert w.dtype == torch.bfloat16, f"{w.dtype} is not bf16"
+                assert u.dtype == torch.bfloat16, f"{u.dtype} is not bf16"
+                assert s.dtype == torch.bfloat16, f"{s.dtype} is not bf16"
+                assert head_size == C // H
                 ctx.B = B
                 ctx.T = T
                 ctx.C = C
@@ -48,7 +53,8 @@ def init_state_autograd(head_size: int, ctx_len: int):
                 wkv6state_cuda.forward(B, T, C, H, r, k, v, w, u, s, y)  # type: ignore
                 return y
 
-        def backward(self, ctx, gy):
+        @staticmethod
+        def backward(ctx, gy):
             with torch.no_grad():
                 assert gy.dtype == torch.bfloat16
                 B = ctx.B
@@ -105,36 +111,40 @@ def init_state_autograd(head_size: int, ctx_len: int):
 
                 return (None, None, None, None, gr, gk, gv, gw, gu, gs)
 
-    return StateCuda
+    return StateCuda.apply
 
 
 def init_rwkv_cuda(head_size: int, ctx_len: int):
-    class RWKVCuda(torch.autograd.Function):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.wkv6_cuda = load(
-                name="wkv6",
-                sources=["time_mixing_op.cpp", f"time_mixing_cuda.cu"],
-                verbose=True,
-                extra_cuda_cflags=[
-                    "-res-usage",
-                    "--use_fast_math",
-                    "-O3",
-                    "-Xptxas -O3",
-                    "--extra-device-vectorization",
-                    f"-D_N_={head_size}",
-                    f"-D_T_={ctx_len}",
-                ],
-            )
+    wkv6_cuda = load(
+        name="wkv6",
+        sources=[
+            resolve_relative_curr_path("time_mixing_op.cpp"),
+            resolve_relative_curr_path("time_mixing_cuda.cu"),
+        ],
+        verbose=True,
+        extra_cuda_cflags=[
+            "-res-usage",
+            "--use_fast_math",
+            "-O3",
+            "-Xptxas -O3",
+            "--extra-device-vectorization",
+            f"-D_N_={head_size}",
+            f"-D_T_={ctx_len}",
+        ],
+    )
 
-        def forward(self, ctx, B, T, C, H, r, k, v, w, u):
+    class RWKVCuda(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, r, k, v, w, u):
             with torch.no_grad():
-                assert r.dtype == torch.bfloat16
-                assert k.dtype == torch.bfloat16
-                assert v.dtype == torch.bfloat16
-                assert w.dtype == torch.bfloat16
-                assert u.dtype == torch.bfloat16
-                assert head_size == C // H
+                B, T, C = r.size()
+                H = C // head_size
+                assert C % head_size == 0
+                assert r.dtype == torch.bfloat16, f"{r.dtype}, is not bf16"
+                assert k.dtype == torch.bfloat16, f"{k.dtype}, is not bf16"
+                assert v.dtype == torch.bfloat16, f"{v.dtype}, is not bf16"
+                assert w.dtype == torch.bfloat16, f"{w.dtype}, is not bf16"
+                assert u.dtype == torch.bfloat16, f"{u.dtype}, is not bf16"
                 ctx.B = B
                 ctx.T = T
                 ctx.C = C
@@ -146,10 +156,12 @@ def init_rwkv_cuda(head_size: int, ctx_len: int):
                 assert u.is_contiguous()
                 ctx.save_for_backward(r, k, v, w, u)
                 y = torch.empty((B, T, C), device=r.device, dtype=torch.bfloat16, memory_format=torch.contiguous_format)
-                self.wkv6_cuda.forward(B, T, C, H, r, k, v, w, u, y)
+
+                wkv6_cuda.forward(B, T, C, H, r, k, v, w, u, y)
                 return y
 
-        def backward(self, ctx, gy):
+        @staticmethod
+        def backward(ctx, gy):
             with torch.no_grad():
                 assert gy.dtype == torch.bfloat16
                 B = ctx.B
@@ -193,11 +205,11 @@ def init_rwkv_cuda(head_size: int, ctx_len: int):
                     dtype=torch.bfloat16,
                     memory_format=torch.contiguous_format,
                 )
-                self.wkv6_cuda.backward(B, T, C, H, r, k, v, w, u, gy, gr, gk, gv, gw, gu)
+                wkv6_cuda.backward(B, T, C, H, r, k, v, w, u, gy, gr, gk, gv, gw, gu)
                 gu = torch.sum(gu, 0).view(H, C // H)
                 return (None, None, None, None, gr, gk, gv, gw, gu)
 
-    return RWKVCuda
+    return RWKVCuda.apply
 
 
 class TimeMixing(nn.Module):
@@ -209,7 +221,7 @@ class TimeMixing(nn.Module):
         attn_dim: int,
         layer_num: int,
         embedding_num: int,
-        tiny_ctx_len: int,
+        ctx_len: int,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -262,14 +274,13 @@ class TimeMixing(nn.Module):
         self.output = nn.Linear(attn_dim, embedding_num, bias=False)
         self.gate = nn.Linear(embedding_num, attn_dim, bias=False)
         self.ln_x = nn.GroupNorm(self.n_head, attn_dim, eps=(1e-5) * (head_size_divisor**2))
-        self.rwkv_cuda = init_rwkv_cuda(self.head_size, tiny_ctx_len)
+        self.rwkv_cuda = init_rwkv_cuda(self.head_size, ctx_len)
+        self.silu = nn.SiLU()
 
     def as_jit(self) -> "TimeMixing":
-        self.forward_part1 = torch.jit.script(self.forward_part1)  # type: ignore
-        self.forward_part2 = torch.jit.script(self.forward_part2)  # type: ignore
         return torch.jit.script(self)  # type: ignore
 
-    def forward_part1(self, x):
+    def forward(self, x):
         B, T, C = x.size()
 
         xx = self.time_shift(x) - x
@@ -288,29 +299,18 @@ class TimeMixing(nn.Module):
         r = self.receptance(xr)
         k = self.key(xk)
         v = self.value(xv)
-        g = F.silu(self.gate(xg))
+        g = self.silu(self.gate(xg))
 
         ww = torch.tanh(xw @ self.time_decay_w1) @ self.time_decay_w2
         w = self.time_decay + ww
 
-        return r, k, v, g, w
+        u = self.time_faaaa
+        x = self.rwkv_cuda(r, k, v, w, u)
 
-    def forward_part2(self, x, g):
-        B, T, C = x.size()
         x = x.view(B * T, C)
-
         x = self.ln_x(x).view(B, T, C)
         x = self.output(x * g)
         return x
-
-    def forward(self, x):
-        B, T, C = x.size()
-        H = self.n_head
-
-        r, k, v, g, w = self.forward_part1(x)
-        x = self.rwkv_cuda.apply(B, T, C, H, r, k, v, w, u=self.time_faaaa)
-
-        return self.forward_part2(x, g)
 
 
 class TimeMixingState(nn.Module):
@@ -322,7 +322,7 @@ class TimeMixingState(nn.Module):
         attn_dim: int,
         layer_num: int,
         embedding_num: int,
-        tiny_ctx_len: int,
+        ctx_len: int,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -376,7 +376,7 @@ class TimeMixingState(nn.Module):
         self.output = nn.Linear(attn_dim, embedding_num, bias=False)
         self.gate = nn.Linear(embedding_num, attn_dim, bias=False)
         self.ln_x = nn.GroupNorm(self.n_head, attn_dim, eps=(1e-5) * (head_size_divisor**2))
-        self.state_cuda = init_state_autograd(self.head_size, tiny_ctx_len)
+        self.state_cuda = init_state_autograd(self.head_size, ctx_len)
 
     def forward_part1(self, x):
         """
@@ -429,6 +429,8 @@ class TimeMixingState(nn.Module):
 
         r, k, v, g, w = self.forward_part1(x)
         # TODO: is headsize currect??
-        x = self.state_cuda.apply(B, T, C, H, r, k, v, w, u=self.time_faaaa, s=self.time_state)
+        u = self.time_faaaa
+        s = self.time_state
+        x = self.state_cuda.apply(B, T, C, H, r, k, v, w, u, s)
 
         return self.forward_part2(x, g)
