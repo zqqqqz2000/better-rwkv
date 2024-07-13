@@ -17,7 +17,7 @@ class Block(nn.Module):
         self,
         layer_id: int,
         embedding_num: int,
-        max_len: int,
+        tiny_ctx_len: int,
         layer_num: int,
         ffn_dim: int,
         head_size: int,
@@ -57,6 +57,7 @@ class Block(nn.Module):
                     attn_dim=attn_dim,
                     layer_num=layer_num,
                     embedding_num=embedding_num,
+                    tiny_ctx_len=tiny_ctx_len,
                 )
             else:
                 self.att = TimeMixing(
@@ -66,6 +67,7 @@ class Block(nn.Module):
                     attn_dim=attn_dim,
                     layer_num=layer_num,
                     embedding_num=embedding_num,
+                    tiny_ctx_len=tiny_ctx_len,
                 )
         self.ffn = ChannelMixing(layer_id=layer_id, layer_num=layer_num, embedding_num=embedding_num, ffn_dim=ffn_dim)
         if tiny_attn_dim > 0 and self.layer_id == attn_layer:
@@ -73,7 +75,7 @@ class Block(nn.Module):
             self.tiny_q = nn.Linear(embedding_num, tiny_attn_dim, bias=False)
             self.tiny_k = nn.Linear(embedding_num, tiny_attn_dim, bias=False)
             self.tiny_v = nn.Linear(embedding_num, embedding_num, bias=False)
-            self.register_buffer("tiny_mask", torch.tril(torch.ones(max_len, max_len)))
+            self.register_buffer("tiny_mask", torch.tril(torch.ones(tiny_ctx_len, tiny_ctx_len)))
         if dropout_p > 0:
             self.drop0 = nn.Dropout(p=dropout_p)
             self.drop1 = nn.Dropout(p=dropout_p)
@@ -116,21 +118,21 @@ class Block(nn.Module):
 class RWKV(Module):
     def __init__(
         self,
-        attn_dim: int,
-        tiny_attn_dim: int,
-        tiny_attn_layer: int,
-        embedding_num: int,
-        vocab_size: int,
-        head_size: int,
-        head_size_divisor: int,
-        layer_num: int,
-        head_qk_dim: int,
-        max_len: int,
+        attn_dim: int = 2048,
+        embedding_num: int = 2048,
+        vocab_size: int = 65536,
+        head_size: int = 64,
+        head_size_divisor: int = 8,
+        layer_num: int = 24,
+        head_qk_dim: int = 0,
         pre_ffn: bool = False,
         ffn_dim: int = 0,
         pos_embedding_dim: int = 0,
         trainable_state: bool = False,
         dropout_p: float = 0,
+        tiny_attn_dim: int = 0,
+        tiny_attn_layer: int = 0,
+        tiny_ctx_len: int = 0,
     ):
         super().__init__()
         if ffn_dim == 0:
@@ -150,7 +152,7 @@ class RWKV(Module):
                 Block(
                     layer_id=i,
                     embedding_num=embedding_num,
-                    max_len=max_len,
+                    tiny_ctx_len=tiny_ctx_len,
                     layer_num=layer_num,
                     ffn_dim=ffn_dim,
                     head_size=head_size,
@@ -174,10 +176,10 @@ class RWKV(Module):
         if head_qk_dim > 0:
             self.head_q = nn.Linear(embedding_num, head_qk_dim, bias=False)
             self.head_k = nn.Linear(embedding_num, head_qk_dim, bias=False)
-            self.register_buffer("copy_mask", torch.tril(torch.ones(max_len, max_len)))
+            self.register_buffer("copy_mask", torch.tril(torch.ones(tiny_ctx_len, tiny_ctx_len)))
         if dropout_p > 0:
             self.drop0 = nn.Dropout(p=dropout_p)
-        self.max_len = max_len
+        self.tiny_ctx_len = tiny_ctx_len
         self.dropout_p = dropout_p
         self.head_qk_dim = head_qk_dim
         self.vocab_size = vocab_size
@@ -186,7 +188,7 @@ class RWKV(Module):
 
     def forward(self, idx: torch.Tensor):
         B, T = idx.size()
-        assert T <= self.max_len, "Cannot forward, model max_len is exhausted."
+        assert T <= self.tiny_ctx_len, "Cannot forward, model tiny_ctx_len is exhausted."
 
         x = self.emb(idx)
         x_emb = x

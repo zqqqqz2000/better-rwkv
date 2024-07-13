@@ -6,7 +6,7 @@ from torch.utils.cpp_extension import load
 def init_state_autograd(head_size: int, ctx_len: int):
     wkv6state_cuda = load(
         name="wkv6state",
-        sources=["wkv6state_op.cpp", f"wkv6state_cuda.cu"],
+        sources=["time_mixing_state_op.cpp", f"time_mixing_state_cuda.cu"],
         verbose=True,
         extra_cuda_cflags=[
             "-res-usage",
@@ -114,7 +114,7 @@ def init_rwkv_cuda(head_size: int, ctx_len: int):
             super().__init__(*args, **kwargs)
             self.wkv6_cuda = load(
                 name="wkv6",
-                sources=["wkv6_op.cpp", f"wkv6_cuda.cu"],
+                sources=["time_mixing_op.cpp", f"time_mixing_cuda.cu"],
                 verbose=True,
                 extra_cuda_cflags=[
                     "-res-usage",
@@ -202,7 +202,14 @@ def init_rwkv_cuda(head_size: int, ctx_len: int):
 
 class TimeMixing(nn.Module):
     def __init__(
-        self, layer_id: int, head_size: int, head_size_divisor: int, attn_dim: int, layer_num: int, embedding_num: int
+        self,
+        layer_id: int,
+        head_size: int,
+        head_size_divisor: int,
+        attn_dim: int,
+        layer_num: int,
+        embedding_num: int,
+        tiny_ctx_len: int,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -240,7 +247,7 @@ class TimeMixing(nn.Module):
             self.time_decay_w1 = nn.Parameter(torch.zeros(embedding_num, D_DECAY_LORA))
             self.time_decay_w2 = nn.Parameter(torch.zeros(D_DECAY_LORA, attn_dim).uniform_(-0.01, 0.01))
 
-            tmp = torch.zeros()
+            tmp = torch.zeros(attn_dim)
             for n in range(attn_dim):
                 zigzag = ((n + 1) % 3 - 1) * 0.1
                 tmp[n] = ratio_0_to_1 * (1 - (n / (attn_dim - 1))) + zigzag
@@ -255,7 +262,7 @@ class TimeMixing(nn.Module):
         self.output = nn.Linear(attn_dim, embedding_num, bias=False)
         self.gate = nn.Linear(embedding_num, attn_dim, bias=False)
         self.ln_x = nn.GroupNorm(self.n_head, attn_dim, eps=(1e-5) * (head_size_divisor**2))
-        self.rwkv_cuda = init_rwkv_cuda(self.head_size, self.ctx_len)
+        self.rwkv_cuda = init_rwkv_cuda(self.head_size, tiny_ctx_len)
 
     def as_jit(self) -> "TimeMixing":
         self.forward_part1 = torch.jit.script(self.forward_part1)  # type: ignore
@@ -306,9 +313,16 @@ class TimeMixing(nn.Module):
         return self.forward_part2(x, g)
 
 
-class TimeMixingState(Module):
+class TimeMixingState(nn.Module):
     def __init__(
-        self, layer_id: int, head_size: int, head_size_divisor: int, attn_dim: int, layer_num: int, embedding_num: int
+        self,
+        layer_id: int,
+        head_size: int,
+        head_size_divisor: int,
+        attn_dim: int,
+        layer_num: int,
+        embedding_num: int,
+        tiny_ctx_len: int,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -362,7 +376,7 @@ class TimeMixingState(Module):
         self.output = nn.Linear(attn_dim, embedding_num, bias=False)
         self.gate = nn.Linear(embedding_num, attn_dim, bias=False)
         self.ln_x = nn.GroupNorm(self.n_head, attn_dim, eps=(1e-5) * (head_size_divisor**2))
-        self.state_cuda = init_state_autograd(self.head_size, self.ctx_len)
+        self.state_cuda = init_state_autograd(self.head_size, tiny_ctx_len)
 
     def forward_part1(self, x):
         """
