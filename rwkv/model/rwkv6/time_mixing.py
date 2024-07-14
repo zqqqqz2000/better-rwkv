@@ -431,6 +431,6 @@ class TimeMixingState(nn.Module):
         # TODO: is headsize currect??
         u = self.time_faaaa
         s = self.time_state
-        x = self.state_cuda.apply(B, T, C, H, r, k, v, w, u, s)
+        x = self.state_cuda(B, T, C, H, r, k, v, w, u, s)
 
         return self.forward_part2(x, g)

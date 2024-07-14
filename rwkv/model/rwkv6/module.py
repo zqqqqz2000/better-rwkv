@@ -2,12 +2,13 @@
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
 ########################################################################################################
 
-import math, gc
+import math
+import gc
 from typing import Dict, Optional
 import torch
 
 import torch.nn as nn
-from torch.nn import Module, functional as F
+from torch.nn import functional as F
 from rwkv.model.rwkv6.time_mixing import TimeMixing, TimeMixingState
 from rwkv.model.rwkv6.channel_mixing import ChannelMixing
 
@@ -115,7 +116,7 @@ class Block(nn.Module):
         return x
 
 
-class RWKV(Module):
+class RWKV(nn.Module):
     def __init__(
         self,
         attn_dim: int = 2048,
